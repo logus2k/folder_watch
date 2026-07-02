@@ -1,0 +1,37 @@
+services:
+  folder-watch-app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: folder_watch:1.0
+    container_name: folder-watch-app
+    restart: unless-stopped
+    environment:
+      # Reach the bus by its service name on the shared network.
+      VALKEY_HOST: valkey-bus
+    volumes:
+      # Mount the host folder(s) to watch; bindings reference container paths.
+      - ./watched:/watched
+      # Persist watch bindings (JSON) so they survive a restart — the host dir is the
+      # source of truth; the store loads it at boot and writes on every CRUD.
+      - ./data:/app/data
+    ports:
+      # Admin API, localhost-bound (nginx fronts external access).
+      # Host port 6821 to avoid colliding with agent-runtime-app (6817).
+      - "127.0.0.1:6821:6817"
+    networks:
+      - logus2k_network
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request,sys; urllib.request.urlopen('http://127.0.0.1:6817/health'); sys.exit(0)"
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+# valkey-bus is owned by the agent_bus compose project; we only join the network.
+networks:
+  logus2k_network:
+    external: true
