@@ -1,9 +1,10 @@
-"""One pytest: dropping a matching file triggers exactly one emit with the right envelope.
+"""Trigger detection: a matching new/modified file fires exactly one emit with the right
+envelope. The bus is mocked (a fake Publisher capturing xadd); no live Valkey is needed.
 
-The bus is mocked (a fake Publisher capturing xadd); no live Valkey is needed. We
-drive the watcher's ``scan_once`` deterministically: first scan seeds the baseline,
-then we drop a file and scan again — that must produce exactly one emit carrying
-``event_data.record_uid`` on the farm stream with ``event_type="file.fired"``.
+The watcher now uses ``watchfiles`` (native events + auto-poll fallback), so instead of
+scanning the filesystem we drive its pure ``handle_changes`` with synthetic watchfiles
+change tuples — deterministic, no FS timing. (A real end-to-end file-drop is verified live
+against the container over the bind mount, not here.)
 """
 
 from __future__ import annotations
@@ -11,6 +12,7 @@ from __future__ import annotations
 import os
 
 import pytest
+from watchfiles import Change
 
 from folder_watch import emitter
 from folder_watch.config import settings
@@ -52,50 +54,58 @@ def fake_bus():
     emitter.set_publisher(None)
 
 
-async def test_new_matching_file_fires_exactly_one_emit(tmp_path, fake_bus):
-    # A binding watching tmp_path for *.pdf, routed to a specific record.
-    record_uid = "proj-uid-1234"
+def _store_with_pdf_binding(folder: str, record_uid: str = "proj-uid-1234") -> BindingStore:
     store = BindingStore()
-    store.create(
-        BindingCreate(
-            record_uid=record_uid,
-            path=str(tmp_path),
-            patterns=["*.pdf"],
-        )
-    )
-    # Real emitter (goes through the fake publisher), real watcher over this store.
+    store.create(BindingCreate(record_uid=record_uid, path=folder, patterns=["*.pdf"]))
+    return store
+
+
+async def test_new_matching_file_fires_exactly_one_emit(tmp_path, fake_bus):
+    record_uid = "proj-uid-1234"
+    store = _store_with_pdf_binding(str(tmp_path), record_uid)
     w = Watcher(binding_store=store, emit=emitter.emit_file_event)
 
-    # A pre-existing non-matching + matching file present at seed time must NOT fire.
-    (tmp_path / "old.pdf").write_text("pre-existing")
-    (tmp_path / "note.txt").write_text("ignored")
-    assert await w.scan_once() == 0  # seed pass: no fires
-    assert fake_bus.published == []
+    # A batch as watchfiles would yield it: one matching *.pdf added + one non-matching.
+    changes = {
+        (Change.added, os.path.join(str(tmp_path), "report.pdf")),
+        (Change.added, os.path.join(str(tmp_path), "skip.log")),
+    }
+    emitted = await w.handle_changes(changes)
 
-    # Drop a NEW matching file, and a NEW non-matching file.
-    (tmp_path / "report.pdf").write_bytes(b"%PDF-1.4 hello")
-    (tmp_path / "skip.log").write_text("nope")
-
-    emitted = await w.scan_once()
-
-    # Exactly one emit — only the *.pdf, only once.
-    assert emitted == 1
+    assert emitted == 1                       # only the *.pdf, only once
     assert len(fake_bus.published) == 1
-
     stream, env = fake_bus.published[0]
-    # Went to the farm stream (stream:agent-runtime).
     assert stream == settings.stream_key("agent-runtime")
     assert env.header.stream_id == "agent-runtime"
     assert env.header.event_type == "file.fired"
     assert env.header.sender == "folder_watch"
-    # The routing key: event_data.record_uid is the deployed Project's record.
     assert env.payload.data == {"record_uid": record_uid}
-    # Provenance in context; the fired file is the pdf we dropped.
     assert env.payload.context["file_path"] == os.path.join(str(tmp_path), "report.pdf")
     assert env.payload.context["change"] == "created"
-    # Stream registered for bus discovery.
     assert fake_bus.active_streams == ["agent-runtime"]
 
-    # Re-scanning with no changes fires nothing more (idempotent baseline).
-    assert await w.scan_once() == 0
-    assert len(fake_bus.published) == 1
+
+async def test_deleted_file_does_not_fire(tmp_path, fake_bus):
+    store = _store_with_pdf_binding(str(tmp_path))
+    w = Watcher(binding_store=store, emit=emitter.emit_file_event)
+    n = await w.handle_changes({(Change.deleted, os.path.join(str(tmp_path), "report.pdf"))})
+    assert n == 0
+    assert fake_bus.published == []
+
+
+async def test_modified_respects_on_modified_flag(tmp_path, fake_bus):
+    store = BindingStore()
+    store.create(BindingCreate(record_uid="r", path=str(tmp_path),
+                               patterns=["*.pdf"], on_modified=False))
+    w = Watcher(binding_store=store, emit=emitter.emit_file_event)
+    # on_modified=False -> a modify must NOT fire; an add still would.
+    assert await w.handle_changes({(Change.modified, os.path.join(str(tmp_path), "a.pdf"))}) == 0
+    assert await w.handle_changes({(Change.added, os.path.join(str(tmp_path), "a.pdf"))}) == 1
+
+
+async def test_file_in_other_folder_does_not_fire(tmp_path, fake_bus):
+    store = _store_with_pdf_binding(str(tmp_path))
+    w = Watcher(binding_store=store, emit=emitter.emit_file_event)
+    # A matching name but under a DIFFERENT folder — not this binding's watch path.
+    n = await w.handle_changes({(Change.added, "/somewhere/else/report.pdf")})
+    assert n == 0

@@ -1,15 +1,18 @@
-"""Watcher — trigger detection.
+"""Watcher — trigger detection via ``watchfiles`` (Rust ``notify`` backend).
 
-A portable polling scanner: each tick it lists the files under every enabled
-binding's folder and compares each matching file's ``(mtime, size)`` signature to
-the previous scan. A file that is **new** (not seen before) or **changed** (signature
-differs, only if ``on_modified``) fires exactly one bus event for that binding via
-``emitter.emit_file_event``.
+Watches the folders named by the enabled bindings and fires exactly one bus event
+(``emitter.emit_file_event``) per matching **new or modified** file. watchfiles uses
+native OS notifications where they work and **auto-falls back to polling** where they
+don't — importantly it auto-enables polling when **WSL is detected** or native events
+are unavailable (Docker bind mounts / network FS), which is exactly our deployment.
+That removes the reliability foot-gun of raw inotify while keeping sub-second latency
+where the OS supports it. Set ``WATCHFILES_FORCE_POLLING=true`` to force polling.
 
-Polling (not inotify) is chosen to keep the service dependency-light and trivially
-testable — a single ``scan_once`` call is deterministic and needs no OS event loop.
-The first scan of a binding **seeds** its baseline without firing, so pre-existing
-files don't stampede on startup.
+Only files created/modified *after* the watch starts fire — pre-existing files never
+stampede on startup (no baseline bookkeeping needed; watchfiles yields only changes).
+Deletes are ignored (the initiator's contract is "a file arrived/changed"). Bindings
+are runtime-mutable: an admin CRUD calls ``reconfigure()`` to restart the watch over the
+new set of folders.
 """
 
 from __future__ import annotations
@@ -19,18 +22,18 @@ import logging
 import os
 from typing import Awaitable, Callable, Optional
 
-from .config import settings
+from watchfiles import Change, awatch
+
 from .emitter import emit_file_event
-from .models import Binding
 from .store import BindingStore, store as default_store
 
 log = logging.getLogger("folder_watch.watcher")
 
-# Signature of one file: (mtime_ns, size). Changing either is a "change".
-Signature = tuple[int, int]
-
 # The emit hook — swappable in tests. Signature mirrors emitter.emit_file_event kwargs.
 EmitFn = Callable[..., Awaitable[str]]
+
+# watchfiles Change -> our envelope's change label. Deletes are dropped (not a trigger).
+_CHANGE_LABEL = {Change.added: "created", Change.modified: "modified"}
 
 
 class Watcher:
@@ -41,93 +44,101 @@ class Watcher:
     ) -> None:
         self._store = binding_store
         self._emit = emit
-        # Per-binding baseline: binding_id -> {abs_path: signature}. A binding that
-        # has never been scanned is absent, which triggers a no-fire seed.
-        self._baseline: dict[str, dict[str, Signature]] = {}
         self._task: Optional[asyncio.Task] = None
-        self._stop = asyncio.Event()
+        # Set to break the current awatch: on a binding CRUD (reconfigure) or on stop.
+        self._interrupt = asyncio.Event()
+        self._stopping = False
 
-    def _snapshot(self, binding: Binding) -> dict[str, Signature]:
-        """Signatures of all matching files currently in the binding's folder."""
-        snap: dict[str, Signature] = {}
-        folder = binding.path
-        if not os.path.isdir(folder):
-            return snap
-        for name in os.listdir(folder):
-            if not binding.matches(name):
-                continue
-            abs_path = os.path.join(folder, name)
-            if not os.path.isfile(abs_path):
-                continue
-            st = os.stat(abs_path)
-            snap[abs_path] = (st.st_mtime_ns, st.st_size)
-        return snap
+    def _watch_paths(self) -> list[str]:
+        """Distinct existing folders named by enabled bindings."""
+        paths = {
+            b.path for b in self._store.list()
+            if b.enabled and b.path and os.path.isdir(b.path)
+        }
+        return sorted(paths)
 
-    async def scan_once(self) -> int:
-        """One scan pass over all enabled bindings. Returns the number of emits.
-
-        First scan of a binding seeds its baseline WITHOUT firing (pre-existing
-        files are not "new"). Subsequent scans fire on new / changed files.
-        """
+    async def handle_changes(self, changes) -> int:
+        """Fire one bus event per (binding, matching new/modified file). Pure w.r.t. the
+        filesystem — driven by watchfiles change tuples, so it is deterministically
+        unit-testable. Returns the number of emits."""
         emitted = 0
-        for binding in self._store.list():
-            if not binding.enabled:
+        for change, fpath in changes:
+            label = _CHANGE_LABEL.get(change)
+            if label is None:  # deleted -> not a trigger
                 continue
-            snap = self._snapshot(binding)
-            prev = self._baseline.get(binding.binding_id)
-            if prev is None:
-                # Seed baseline; do not fire on pre-existing files.
-                self._baseline[binding.binding_id] = snap
-                continue
-            for abs_path, sig in snap.items():
-                old = prev.get(abs_path)
-                if old is None:
-                    change = "created"
-                elif old != sig and binding.on_modified:
-                    change = "modified"
-                else:
+            folder = os.path.normpath(os.path.dirname(fpath))
+            name = os.path.basename(fpath)
+            for b in self._store.list():
+                if not b.enabled:
                     continue
-                emitted += 1
+                if os.path.normpath(b.path) != folder:
+                    continue
+                if not b.matches(name):
+                    continue
+                if label == "modified" and not b.on_modified:
+                    continue
                 await self._emit(
-                    record_uid=binding.record_uid,
-                    binding_id=binding.binding_id,
-                    file_path=abs_path,
-                    change=change,
+                    record_uid=b.record_uid,
+                    binding_id=b.binding_id,
+                    file_path=fpath,
+                    change=label,
                 )
-            self._baseline[binding.binding_id] = snap
+                emitted += 1
         return emitted
 
-    def forget(self, binding_id: str) -> None:
-        """Drop a binding's baseline (e.g. on delete) so a re-create re-seeds."""
-        self._baseline.pop(binding_id, None)
-
     async def run(self) -> None:
-        """Poll loop until ``stop()``."""
-        self._stop.clear()
-        log.info("watcher started (poll=%.1fs)", settings.poll_interval_s)
-        while not self._stop.is_set():
+        """Watch loop until ``stop()``. Restarts the underlying awatch whenever the set of
+        watched folders changes (a binding was added/removed/edited)."""
+        log.info("watcher started (watchfiles %s)", _wf_version())
+        while not self._stopping:
+            self._interrupt.clear()
+            paths = self._watch_paths()
+            if not paths:
+                # Nothing to watch yet — wait for a reconfigure (binding added) or stop.
+                await self._interrupt.wait()
+                continue
+            log.info("watching %d folder(s): %s", len(paths), paths)
             try:
-                await self.scan_once()
+                # recursive=False: fire only on files directly in a bound folder (the
+                # binding's patterns match the basename), matching the block's contract.
+                async for changes in awatch(
+                    *paths, stop_event=self._interrupt, recursive=False
+                ):
+                    await self.handle_changes(changes)
             except Exception:
-                # A scan error must be loud but must not kill the loop.
-                log.error("scan pass failed", exc_info=True)
-            try:
-                await asyncio.wait_for(
-                    self._stop.wait(), timeout=settings.poll_interval_s
-                )
-            except asyncio.TimeoutError:
-                pass
+                # A watch error must be loud but must not kill the loop.
+                log.error("watch loop failed; retrying", exc_info=True)
+                await asyncio.sleep(1)
         log.info("watcher stopped")
+
+    def reconfigure(self) -> None:
+        """Signal that the binding set changed — restart the watch over the new folders."""
+        self._interrupt.set()
+
+    # Back-compat alias: a binding edit/delete used to "forget" a baseline; now any binding
+    # change simply reconfigures the watch (watchfiles keeps no per-file baseline).
+    def forget(self, binding_id: str) -> None:  # noqa: ARG002 - id unused, kept for the API
+        self.reconfigure()
 
     def start(self) -> None:
         if self._task is None:
+            self._stopping = False
             self._task = asyncio.create_task(self.run())
 
     async def stop(self) -> None:
-        self._stop.set()
+        self._stopping = True
+        self._interrupt.set()
         if self._task is not None:
             await self._task
             self._task = None
+
+
+def _wf_version() -> str:
+    try:
+        import watchfiles
+        return watchfiles.__version__
+    except Exception:  # pragma: no cover
+        return "?"
 
 
 watcher = Watcher()

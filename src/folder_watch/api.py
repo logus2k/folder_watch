@@ -51,7 +51,10 @@ def create_app(*, run_watcher: bool = True, connect_emitter: bool = True) -> Fas
 
     @app.post("/bindings", response_model=Binding, status_code=201)
     async def create_binding(data: BindingCreate) -> Binding:
-        return store.create(data)
+        binding = store.create(data)
+        # A new binding may add a folder to watch — restart the watch over the new set.
+        watcher.reconfigure()
+        return binding
 
     @app.get("/bindings/{binding_id}", response_model=Binding)
     async def get_binding(binding_id: str) -> Binding:

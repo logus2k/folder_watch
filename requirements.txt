@@ -4,6 +4,7 @@
 fastapi==0.121.1         # admin API
 uvicorn==0.49.0          # ASGI server (matches agent_bus)
 valkey-glide==2.4.2      # bus event emission — pinned to match agent_bus wire client
+watchfiles==1.2.0        # file-change detection (Rust notify; native events + auto-poll fallback / WSL)
 pydantic==2.13.4         # models + vendored EventEnvelope (match agent_bus)
 python-dotenv==1.2.2     # .env loading for local/dev
 
