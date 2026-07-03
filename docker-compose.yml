@@ -3,6 +3,10 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      # Canonical envelope + firing contract (fired_event/seed_of) from the shared
+      # agent-bus-client SDK instead of a vendored copy (single source of truth).
+      additional_contexts:
+        busclient_sdk: ../agent_bus/sdk/python
     image: folder_watch:1.0
     container_name: folder-watch-app
     restart: unless-stopped

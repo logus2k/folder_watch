@@ -19,7 +19,7 @@ from typing import Any, Optional
 
 from .bus_client import Publisher
 from .config import settings
-from .envelope import new_event, now_iso
+from agent_bus_client import new_event, now_iso
 
 log = logging.getLogger("folder_watch.emitter")
 
@@ -88,13 +88,17 @@ async def emit_file_event(
             "fired_at": now_iso(),
         }
 
+        # Workflow-firing contract (agent-bus-client fired_event / seed_of): `data` carries
+        # the routing key AND the SEED. For a file trigger the seed is the file path (the
+        # workflow acts on "a file arrived at X"; reading its contents is a downstream step).
+        # Provenance stays in `context`. Without `task`, the graph starts from an empty message.
         env = new_event(
             stream_id=stream_id,
             cid=cid,
             sid=sid,
             sender=settings.sender_id,
             event_type=settings.event_type,
-            data={"record_uid": record_uid},
+            data={"record_uid": record_uid, "task": file_path},
             context=context,
         )
 

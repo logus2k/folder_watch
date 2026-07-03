@@ -24,7 +24,7 @@ from glide import (
 )
 
 from .config import Settings, settings as default_settings
-from .envelope import EventEnvelope
+from agent_bus_client import EventEnvelope
 
 log = logging.getLogger("folder_watch.bus")
 

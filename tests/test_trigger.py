@@ -16,7 +16,7 @@ from watchfiles import Change
 
 from folder_watch import emitter
 from folder_watch.config import settings
-from folder_watch.envelope import EventEnvelope
+from agent_bus_client import EventEnvelope
 from folder_watch.models import BindingCreate
 from folder_watch.store import BindingStore
 from folder_watch.watcher import Watcher
@@ -79,7 +79,11 @@ async def test_new_matching_file_fires_exactly_one_emit(tmp_path, fake_bus):
     assert env.header.stream_id == "agent-runtime"
     assert env.header.event_type == "file.fired"
     assert env.header.sender == "folder_watch"
-    assert env.payload.data == {"record_uid": record_uid}
+    # Firing contract: data carries the routing key AND the seed (file path is the task).
+    assert env.payload.data == {
+        "record_uid": record_uid,
+        "task": os.path.join(str(tmp_path), "report.pdf"),
+    }
     assert env.payload.context["file_path"] == os.path.join(str(tmp_path), "report.pdf")
     assert env.payload.context["change"] == "created"
     assert fake_bus.active_streams == ["agent-runtime"]

@@ -16,6 +16,11 @@ WORKDIR /app
 COPY requirements.txt ./
 RUN pip install -r requirements.txt
 
+# Shared bus SDK (canonical envelope + firing contract) from the sibling agent_bus repo,
+# supplied as a named build context by docker-compose (busclient_sdk = ../agent_bus/sdk/python).
+COPY --from=busclient_sdk . /opt/busclient_sdk
+RUN pip install /opt/busclient_sdk
+
 # Application source (package lives under src/folder_watch).
 COPY src/ ./src/
 ENV PYTHONPATH=/app/src
