@@ -26,6 +26,30 @@ log = logging.getLogger("folder_watch.emitter")
 # Process-global publisher, set in connect(); read by emit_file_event.
 _publisher: Optional[Publisher] = None
 
+# Cap the file content folded into the workflow seed so a huge drop can't blow up the
+# event / the downstream LLM context. Text past this is truncated with a marker.
+_MAX_SEED_BYTES = 200_000
+
+
+def read_seed(file_path: str, max_bytes: int = _MAX_SEED_BYTES) -> str:
+    """The workflow SEED for a file trigger = the file's TEXT CONTENT (so the Agent acts on
+    what's IN the file, not just its path). Binary/undecodable files fall back to a clear
+    marker (never garbage); an unreadable file falls back to the path. Size-capped."""
+    try:
+        with open(file_path, "rb") as fh:
+            raw = fh.read(max_bytes + 1)
+    except OSError:
+        return file_path  # can't read it → path is the best we can do (loud downstream)
+    truncated = len(raw) > max_bytes
+    raw = raw[:max_bytes]
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return f"[binary file {file_path}: {len(raw)} bytes, not UTF-8 text]"
+    if truncated:
+        text += f"\n[...truncated at {max_bytes} bytes]"
+    return text
+
 
 async def connect() -> Publisher:
     """Establish the shared publisher (idempotent)."""
@@ -89,16 +113,16 @@ async def emit_file_event(
         }
 
         # Workflow-firing contract (agent-bus-client fired_event / seed_of): `data` carries
-        # the routing key AND the SEED. For a file trigger the seed is the file path (the
-        # workflow acts on "a file arrived at X"; reading its contents is a downstream step).
-        # Provenance stays in `context`. Without `task`, the graph starts from an empty message.
+        # the routing key AND the SEED. For a file trigger the seed is the file's CONTENT so
+        # the Agent acts on what's IN the file (not just its path); the path stays in
+        # `context` for provenance. Without `task`, the graph starts from an empty message.
         env = new_event(
             stream_id=stream_id,
             cid=cid,
             sid=sid,
             sender=settings.sender_id,
             event_type=settings.event_type,
-            data={"record_uid": record_uid, "task": file_path},
+            data={"record_uid": record_uid, "task": read_seed(file_path)},
             context=context,
         )
 

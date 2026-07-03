@@ -65,9 +65,14 @@ async def test_new_matching_file_fires_exactly_one_emit(tmp_path, fake_bus):
     store = _store_with_pdf_binding(str(tmp_path), record_uid)
     w = Watcher(binding_store=store, emit=emitter.emit_file_event)
 
+    # The matching file exists with real content (the seed is its CONTENT, not its path).
+    pdf_path = os.path.join(str(tmp_path), "report.pdf")
+    with open(pdf_path, "w", encoding="utf-8") as fh:
+        fh.write("the quarterly numbers are up 12%")
+
     # A batch as watchfiles would yield it: one matching *.pdf added + one non-matching.
     changes = {
-        (Change.added, os.path.join(str(tmp_path), "report.pdf")),
+        (Change.added, pdf_path),
         (Change.added, os.path.join(str(tmp_path), "skip.log")),
     }
     emitted = await w.handle_changes(changes)
@@ -79,12 +84,13 @@ async def test_new_matching_file_fires_exactly_one_emit(tmp_path, fake_bus):
     assert env.header.stream_id == "agent-runtime"
     assert env.header.event_type == "file.fired"
     assert env.header.sender == "folder_watch"
-    # Firing contract: data carries the routing key AND the seed (file path is the task).
+    # Firing contract: data carries the routing key AND the seed — the seed is the file's
+    # CONTENT so the Agent acts on what's IN the file; the path stays in context.
     assert env.payload.data == {
         "record_uid": record_uid,
-        "task": os.path.join(str(tmp_path), "report.pdf"),
+        "task": "the quarterly numbers are up 12%",
     }
-    assert env.payload.context["file_path"] == os.path.join(str(tmp_path), "report.pdf")
+    assert env.payload.context["file_path"] == pdf_path
     assert env.payload.context["change"] == "created"
     assert fake_bus.active_streams == ["agent-runtime"]
 
