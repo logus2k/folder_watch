@@ -95,8 +95,46 @@ async def test_new_matching_file_fires_exactly_one_emit(tmp_path, fake_bus):
     assert fake_bus.active_streams == ["agent-runtime"]
 
 
-async def test_deleted_file_does_not_fire(tmp_path, fake_bus):
+async def test_deleted_file_does_not_fire_by_default(tmp_path, fake_bus):
+    """`on_deleted` defaults to False → a delete is dropped (the initiator's original
+    'a file arrived/changed' contract; existing bindings are unaffected)."""
     store = _store_with_pdf_binding(str(tmp_path))
+    w = Watcher(binding_store=store, emit=emitter.emit_file_event)
+    n = await w.handle_changes({(Change.deleted, os.path.join(str(tmp_path), "report.pdf"))})
+    assert n == 0
+    assert fake_bus.published == []
+
+
+async def test_deleted_fires_when_on_deleted_enabled(tmp_path, fake_bus):
+    """Opting in with `on_deleted=True` fires exactly one event labelled change="deleted"."""
+    store = BindingStore()
+    store.create(BindingCreate(record_uid="r-del", path=str(tmp_path),
+                               patterns=["*.pdf"], on_deleted=True))
+    w = Watcher(binding_store=store, emit=emitter.emit_file_event)
+
+    gone = os.path.join(str(tmp_path), "report.pdf")   # never created == deleted
+    n = await w.handle_changes({
+        (Change.deleted, gone),
+        (Change.deleted, os.path.join(str(tmp_path), "skip.log")),  # non-matching glob
+    })
+
+    assert n == 1                                  # only the *.pdf
+    assert len(fake_bus.published) == 1
+    _, env = fake_bus.published[0]
+    assert env.header.event_type == "file.fired"
+    assert env.payload.context["change"] == "deleted"
+    assert env.payload.context["file_path"] == gone
+    assert env.payload.data["record_uid"] == "r-del"
+    # The file is gone, so read_seed's OSError branch falls back to the PATH as the seed
+    # (there is no content left to read) — context["change"] tells the Agent it's a delete.
+    assert env.payload.data["task"] == gone
+
+
+async def test_deleted_does_not_fire_when_on_deleted_disabled(tmp_path, fake_bus):
+    """Explicit on_deleted=False stays silent even though watchfiles reports the delete."""
+    store = BindingStore()
+    store.create(BindingCreate(record_uid="r", path=str(tmp_path),
+                               patterns=["*.pdf"], on_deleted=False))
     w = Watcher(binding_store=store, emit=emitter.emit_file_event)
     n = await w.handle_changes({(Change.deleted, os.path.join(str(tmp_path), "report.pdf"))})
     assert n == 0

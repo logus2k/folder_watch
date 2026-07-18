@@ -13,6 +13,14 @@ services:
     environment:
       # Reach the bus by its service name on the shared network.
       VALKEY_HOST: valkey-bus
+      # Use NATIVE inotify instead of watchfiles' polling fallback. watchfiles auto-forces
+      # polling on ANY WSL kernel (it only checks for "microsoft-standard" in uname.release),
+      # which costs ~250ms latency vs ~50ms for inotify. That fallback exists because inotify
+      # is dead on Windows-backed /mnt/* (9p) mounts — measured: zero events. We watch LINUX
+      # paths only (./watched is ext4), where inotify is verified working, so the fallback is
+      # pure cost. NOTE: if a watched folder is ever moved onto /mnt/c, REMOVE this — it would
+      # go silent. Also: under inotify an atomic replace reports "created" (not "modified").
+      WATCHFILES_FORCE_POLLING: "false"
     volumes:
       # Mount the host folder(s) to watch; bindings reference container paths.
       - ./watched:/watched

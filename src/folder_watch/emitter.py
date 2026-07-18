@@ -13,7 +13,9 @@ The publisher is a process global, established once at startup via ``connect()``
 
 from __future__ import annotations
 
+import base64
 import logging
+import os
 import uuid
 from typing import Any, Optional
 
@@ -51,6 +53,53 @@ def read_seed(file_path: str, max_bytes: int = _MAX_SEED_BYTES) -> str:
     return text
 
 
+class SeedTooLarge(RuntimeError):
+    """A content seed above the binding's cap. Raised rather than truncated: half a
+    PDF is not a document, and silently shipping one is worse than not firing."""
+
+
+def build_seed(file_path: str, change: str, emit: str = "path",
+               max_content_mb: int = 64) -> str:
+    """The seed, per the binding's ``emit``.
+
+    * ``path``    → the file path. What a consumer that reads the bytes itself wants
+                    (an Ingestion block: the Agent has the same mount, so base64ing
+                    a PDF through the bus to it is pure overhead).
+    * ``content`` → the file's text, or BASE64 for binary. Not a marker string: a
+                    marker is indistinguishable from data downstream and fails
+                    silently, which is exactly how a PDF drop looked like a
+                    successful ingest of the literal text "[binary file …]".
+
+    A DELETE has no content to read, so its seed is always the path regardless of
+    ``emit`` — the consumer must branch on ``context.change`` rather than trust the
+    seed's shape.
+    """
+    if change == "deleted" or emit == "path":
+        return file_path
+
+    cap = max(1, int(max_content_mb)) * 1024 * 1024
+    try:
+        size = os.path.getsize(file_path)
+    except OSError:
+        return file_path
+    if size > cap:
+        raise SeedTooLarge(
+            f"{file_path}: {size / 1048576:.1f}MB exceeds the binding's "
+            f"max_content_mb={max_content_mb}")
+    try:
+        with open(file_path, "rb") as fh:
+            raw = fh.read()
+    except OSError:
+        return file_path
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
+        # Binary + content → the file ITSELF, base64. The bus is Valkey streams —
+        # in-memory and retained — so this is ~1.33x the file on the wire, which is
+        # why the cap is per-binding and configurable.
+        return base64.b64encode(raw).decode("ascii")
+
+
 async def connect() -> Publisher:
     """Establish the shared publisher (idempotent)."""
     global _publisher
@@ -86,11 +135,16 @@ async def emit_file_event(
     binding_id: str,
     file_path: str,
     change: str,
+    emit: str = "content",
+    max_content_mb: int = 64,
 ) -> str:
     """Build and publish one file.fired EventEnvelope. Returns the entry id.
 
     ``event_data`` carries ONLY ``record_uid`` (the farm's routing key, §9.3);
     the file details are provenance and live in ``payload.context``.
+
+    ``emit`` defaults to ``content`` so bindings created before the field existed
+    keep their behaviour exactly.
     """
     if _publisher is None:
         raise RuntimeError("publisher not connected; call connect() at startup")
@@ -112,18 +166,22 @@ async def emit_file_event(
             "fired_at": now_iso(),
         }
 
-        # Workflow-firing contract (agent-bus-client fired_event / seed_of): `data` carries
-        # the routing key AND the SEED. For a file trigger the seed is the file's CONTENT so
-        # the Agent acts on what's IN the file (not just its path); the path stays in
-        # `context` for provenance. Without `task`, the graph starts from an empty message.
+        # Workflow-firing contract (agent-bus-client fired_event / seed_of): `data`
+        # carries the routing key AND the SEED. What the seed IS depends on the
+        # binding's `emit`: the file's content (an Agent acts on what's in it) or
+        # its path (an Ingestion block reads the bytes off the same mount). The
+        # path and the change type ALWAYS stay in `context` — a consumer must be
+        # able to tell an ingest from a removal without guessing at the seed's
+        # shape. Without `task`, the graph starts from an empty message.
         env = new_event(
             stream_id=stream_id,
             cid=cid,
             sid=sid,
             sender=settings.sender_id,
             event_type=settings.event_type,
-            data={"record_uid": record_uid, "task": read_seed(file_path)},
-            context=context,
+            data={"record_uid": record_uid,
+                  "task": build_seed(file_path, change, emit, max_content_mb)},
+            context={**context, "emit": emit},
         )
 
         # Register the stream so agent_bus discovery/observers/reaper see it.

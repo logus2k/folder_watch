@@ -29,6 +29,19 @@ class BindingCreate(BaseModel):
     # Optional human label; also fire on modification (not just creation).
     name: Optional[str] = None
     on_modified: bool = True
+    # Fire when a matching file is DELETED (change="deleted"). Off by default: the initiator's
+    # historic contract was "a file arrived/changed", so existing bindings keep that behaviour.
+    on_deleted: bool = False
+    # What the fired event's SEED carries: the file's `path`, or its `content`
+    # (text, or base64 for binary — never a marker string, which is
+    # indistinguishable from data downstream and fails silently).
+    # Default `content` preserves the behaviour of bindings created before this
+    # field existed.
+    emit: str = "content"
+    # Cap for `emit=content`. The bus is Valkey streams — in-memory and retained —
+    # so a large file is ~1.33x its size sitting on the wire. Above this the fire
+    # FAILS rather than shipping half a document.
+    max_content_mb: int = 64
     enabled: bool = True
 
 
@@ -38,6 +51,9 @@ class BindingUpdate(BaseModel):
     patterns: Optional[list[str]] = None
     name: Optional[str] = None
     on_modified: Optional[bool] = None
+    on_deleted: Optional[bool] = None
+    emit: Optional[str] = None
+    max_content_mb: Optional[int] = None
     enabled: Optional[bool] = None
 
 
@@ -48,6 +64,17 @@ class Binding(BaseModel):
     patterns: list[str] = Field(default_factory=list)
     name: Optional[str] = None
     on_modified: bool = True
+    on_deleted: bool = False
+    # What the fired event's SEED carries: the file's `path`, or its `content`
+    # (text, or base64 for binary — never a marker string, which is
+    # indistinguishable from data downstream and fails silently).
+    # Default `content` preserves the behaviour of bindings created before this
+    # field existed.
+    emit: str = "content"
+    # Cap for `emit=content`. The bus is Valkey streams — in-memory and retained —
+    # so a large file is ~1.33x its size sitting on the wire. Above this the fire
+    # FAILS rather than shipping half a document.
+    max_content_mb: int = 64
     enabled: bool = True
 
     def matches(self, filename: str) -> bool:
